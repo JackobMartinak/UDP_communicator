@@ -12,15 +12,15 @@ import random
 import re
 
 # CONFIG    ====================================================
-IP_CLIENT = "127.0.0.1"
+IP_CLIENT = ""
 PORT_CLIENT = 8000
-IP_SERVER = "127.0.0.2"
+IP_SERVER = ""
 PORT_SERVER = 8000
 MAX_PACKET_SIZE = 1469
 HEADER_SIZE = 9
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 PACKET_TYPES = {
-    "INIT": 0x01,
+    "SYN": 0x01,
     "DATA": 0x02,
     "ACK": 0x03,
     "FIN": 0x04,
@@ -42,8 +42,25 @@ PACKET_TYPES = {
 
 # ==============================================================
 
-
 # FUNCTIONS ====================================================
+
+def get_ethernet_ip():
+    try:
+        # Create a dummy socket to make a connection
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+        # Connect to a public DNS server (Google's 8.8.8.8) on port 80
+        s.connect(("8.8.8.8", 80))
+
+        # Get the local IP address to which the socket is connected
+        ip = s.getsockname()[0]
+        print(ip)
+
+        s.close()
+        return ip
+    except Exception:
+        return "Unable to determine Ethernet IP"
+
 
 def corrupt_packet(packet, corruption_rate=0.01):
     """
@@ -125,7 +142,7 @@ def send_packet(sock, packet, address, timeout=5):
         sock.sendto(packet, address)
 
         # Wait for ACK
-        response, _ = sock.recvfrom(1024)  # Buffer size for ACK
+        response, IP_SERVER = sock.recvfrom(1024)  # Buffer size for ACK
         if int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("ACK"):
             return response
         elif int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("ERROR"):
@@ -189,6 +206,8 @@ class CustomHeader:
 client_socket = None
 server_socket = None
 count_of_starts = 0
+count_of_switches = 0
+switch_initiated = False
 while True:
     if count_of_starts == 0:
         print("==========================================================")
@@ -201,17 +220,38 @@ while True:
         print("==========================================================")
         print("Choose if you want to be a client or server")
         print("==========================================================")
+    if not switch_initiated:
+        chose_input = input("Choose input: 1 - client, 2 - server, 3 - switch: ")
 
-    chose_input = input("Choose input: 1 - client, 2 - server, 3 - switch: ")
     MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
     if chose_input == "1":  # Client Side
-        IP_SERVER = input("Enter server IP: ")
-        PORT_SERVER = int(input("Enter server port: "))
+        if not switch_initiated:
+            IP_SERVER = input("Enter server IP: ")
+            PORT_SERVER = int(input("Enter server port: "))
+            IP_CLIENT = get_ethernet_ip()
+            print(f" CLIENT IP : {IP_CLIENT}")
+
+        else:
+            IP_SERVER = IP_CLIENT[0]
+            if count_of_switches == 1:
+                PORT_SERVER = int(input("Enter server port: "))
+                count_of_switches = 0
+
         # Create a UDP socket
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (IP_SERVER, PORT_SERVER)
 
-        file_or_text = input("Choose input: 1 - text, 2 - file: ")
+        file_or_text = input("Choose input: 1 - text, 2 - file, 3 - switch, 0 - exit: ")
+        if file_or_text == "0":
+            print("Exiting...")
+            if client_socket is not None:
+                client_socket.close()
+            if server_socket is not None:
+                server_socket.close()
+            break
+        elif file_or_text == "3":
+            chose_input = "3"
+            continue
         corrupt = input("Do you want to corrupt packets? (y/n): ")
         packet_data_size = int(input(f"Enter packet data size (MAX {MAX_DATA_SIZE}): "))
         if packet_data_size != "" and not packet_data_size > MAX_DATA_SIZE:
@@ -232,7 +272,7 @@ while True:
                 # if sequence_number == 0:  # send init packet
                 # crc = calculate_crc16("Init")
                 crc = calculate_crc16(b"Init")
-                header_init = CustomHeader(PACKET_TYPES.get("INIT"), sequence_bytes, total_chunks_bytes, crc)
+                header_init = CustomHeader(PACKET_TYPES.get("SYN"), sequence_bytes, total_chunks_bytes, crc)
                 info_data = header_init.serialize() + b'text'
                 response = send_packet(client_socket, info_data, server_address)
                 print(f"Response: {response}")
@@ -285,7 +325,11 @@ while True:
 
             finally:
                 print("Message sent successfully")
-                continue
+                print(f" CLIENT IP : {IP_CLIENT}")
+                print(f" CLIENT PORT : {PORT_CLIENT}")
+                print(f" SERVER IP : {IP_SERVER}")
+                print(f" SERVER PORT : {PORT_SERVER}")
+                # continue
                 # finally:
             #     print("Closing socket")
             #     client_socket.close()
@@ -310,7 +354,7 @@ while True:
                 total_chunks_bytes = int_to_3bytes(total_chunks)
                 if sequence_number == 0:  # send init packet
                     crc = calculate_crc16(b"Init")
-                    header_init = CustomHeader(PACKET_TYPES.get("INIT"), sequence_bytes, total_chunks_bytes, crc)
+                    header_init = CustomHeader(PACKET_TYPES.get("SYN"), sequence_bytes, total_chunks_bytes, crc)
                     info_data = header_init.serialize() + b'file' + file_path + file_name
                     response = send_packet(client_socket, info_data, server_address)
                     if response:
@@ -366,6 +410,8 @@ while True:
 
         # Set up the server socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        IP_SERVER = get_ethernet_ip()
+        PORT_SERVER = int(input("Enter server port: "))
         server_address = (IP_SERVER, PORT_SERVER)
         server_socket.bind(server_address)
         print(f"Starting up on {server_address[0]} port {server_address[1]}")
@@ -377,8 +423,8 @@ while True:
             while True:
                 server_socket.settimeout(15)
                 print("\nWaiting to receive message...")
-                packet, address = server_socket.recvfrom(MAX_PACKET_SIZE)
-                print(f"[+DEBUG+]Received {len(packet)} bytes from {address}")
+                packet, IP_CLIENT = server_socket.recvfrom(MAX_PACKET_SIZE)
+                print(f"[+DEBUG+]Received {len(packet)} bytes from {IP_CLIENT[0]}")
                 # Assuming the custom header is at the beginning of the packet
                 header_data = packet[:HEADER_SIZE]  # 1 + 3 + 4 + 2 + 1 = 11 bytes for the header
                 message_data = packet[HEADER_SIZE:]  # The rest is the payload
@@ -390,14 +436,16 @@ while True:
                 computed_crc = binascii.crc_hqx(message_data, 0)
                 if header.command == 0x06:  # CHANGE packet
                     print("Change packet received")
-                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), address)
+                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), IP_CLIENT)
                     print("Closing connection...")
                     server_socket.close()
+                    switch_initiated = True
+                    chose_input = "1"
                     break
-                if header.command == 0x01:  # INIT packet
+                if header.command == 0x01:  # SYN packet
                     print("Init packet received")
                     type_of_data = message_data[0:4]
-                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), address)
+                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), IP_CLIENT)
                     if type_of_data == b'file':
                         print("File transfer initiated")
                         file_info = bytes.decode(message_data[4:])
@@ -415,18 +463,18 @@ while True:
                 if received_crc != computed_crc:  # CRC check
                     print("CRC check failed, packet corrupted.")
                     server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ERROR"),
-                                                      length=1, byteorder='big'), address)
+                                                      length=1, byteorder='big'), IP_CLIENT)
                 else:
                     if header.command == 0x02:  # DATA packet
                         print("Data packet received")
                         # send back to client
                         server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"),
-                                                          length=1, byteorder='big'), address)
+                                                          length=1, byteorder='big'), IP_CLIENT)
                     elif header.command == 0x04:  # FIN packet
                         print("FIN packet received")
                         # send back to client
                         server_socket.sendto(int.to_bytes(PACKET_TYPES.get("FINACK"),
-                                                          length=1, byteorder='big'), address)
+                                                          length=1, byteorder='big'), IP_CLIENT)
                 # Output the received header and data for demonstration purposes
                 print(
                     f"Received header: Command={header.command}, "
@@ -458,26 +506,34 @@ while True:
         except socket.timeout:
             print("Timeout, closing connection...")
             server_socket.close()
+            switch_initiated = False
             continue
         finally:
-            server_socket.close()
+            pass
+            # server_socket.close()
 
     elif chose_input == "3":  # Switch
-        if client_socket is None:
-            print("You are not connected to server")
+        try:
+            crc = calculate_crc16(b"Change")
+            header_init = CustomHeader(PACKET_TYPES.get("CHANGE"), b"0", b"0", crc)
+            info_data = header_init.serialize()
+            response = send_packet(client_socket, info_data, (IP_SERVER, PORT_SERVER))
+            if response:
+                switch_initiated = True
+                print("Change Innitiated")
+                client_socket.close()
+                chose_input = "2"
+                temp = IP_SERVER
+                IP_SERVER = IP_CLIENT[0]
+                IP_CLIENT = temp
+                temp = PORT_SERVER
+                PORT_SERVER = PORT_CLIENT
+                PORT_CLIENT = temp
+                count_of_switches = 1
+                continue
+        except Exception as e:
+            print(e)
             continue
-        if server_socket is None:
-            print("There is no server running")
-            continue
-        crc = calculate_crc16(b"Change")
-        header_init = CustomHeader(PACKET_TYPES.get("CHANGE"), b"0", b"0", crc)
-        info_data = header_init.serialize()
-        response = send_packet(client_socket, info_data, (IP_SERVER, PORT_SERVER))
-        if response:
-            print("Change Innitiated")
-            client_socket.close()
-            continue
-
     elif chose_input == "0":
         print("Exiting...")
         if client_socket is not None:
