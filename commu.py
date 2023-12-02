@@ -9,9 +9,7 @@ import binascii
 import os
 import math
 import random
-import threading
-import time
-
+import re
 
 # CONFIG    ====================================================
 IP_CLIENT = "127.0.0.1"
@@ -19,27 +17,29 @@ PORT_CLIENT = 8000
 IP_SERVER = "127.0.0.2"
 PORT_SERVER = 8000
 MAX_PACKET_SIZE = 1469
-HEADER_SIZE = 10
+HEADER_SIZE = 9
 MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
 PACKET_TYPES = {
-    "Init": 0x01,
-    "Data": 0x02,
-    "Ack": 0x03,
-    "Fin": 0x04,
-    "FinAck": 0x05,
-    "Change": 0x06
+    "INIT": 0x01,
+    "DATA": 0x02,
+    "ACK": 0x03,
+    "FIN": 0x04,
+    "FINACK": 0x05,
+    "CHANGE": 0x06,
+    "ERROR": 0x07,
 }
 
 """
     Header:
         1b typ
         3b cislo sekvencie
-        4b ID file
+        3B pocet fragmentov
         2B crc
-        1b flag - Not used
-        Payload size = 1458 bytes
+        Payload size = 1459 bytes
         full packet size = 1469 bytes
 """
+
+
 # ==============================================================
 
 
@@ -61,6 +61,7 @@ def corrupt_packet(packet, corruption_rate=0.01):
         if random.random() < corruption_rate:
             corrupted_packet[i] = corrupted_packet[i] ^ random.getrandbits(8)
     return bytes(corrupted_packet)
+
 
 def calculate_total_chunks(file_path, chunk_size):
     # Get the size of the file
@@ -125,7 +126,13 @@ def send_packet(sock, packet, address, timeout=5):
 
         # Wait for ACK
         response, _ = sock.recvfrom(1024)  # Buffer size for ACK
-        if int.from_bytes(response, byteorder='big') == 0x03:
+        if int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("ACK"):
+            return response
+        elif int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("ERROR"):
+            return response
+        elif int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("CHANGE"):
+            return response
+        elif int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("FINACK"):
             return response
     except socket.timeout:
         count = 0
@@ -138,31 +145,32 @@ def send_packet(sock, packet, address, timeout=5):
             except socket.timeout:
                 count += 1
         print("Server not responding, closing connection...")
-        # sock.close()
         return None
-        # return None
 
 
-# def get_input(timeout):
-#     print(f"You have {timeout} seconds to type your input...")
-#     input_thread = threading.Thread(target=input, args=("Choose input: 1 - client, 2 - server: ",))
-#     input_thread.start()
-#     input_thread.join(timeout)
-#     if input_thread.is_alive():
-#         print("\nTimeout! No input was entered.")
-#         return None
-#     else:
-#         return input_thread.result
+def split_into_chunks(message, chunk_size):
+    return [message[i:i + chunk_size] for i in range(0, len(message), chunk_size)]
 
+
+def calculate_chunk_count(message_length, chunk_size):
+    return math.ceil(message_length / chunk_size)
+
+
+def extract_filename(path):
+    pattern = r'[^/\\]+$'
+    match = re.search(pattern, path)
+    if match:
+        return match.group()
+    return None
 
 # ==============================================================
 
 
 class CustomHeader:
-    def __init__(self, command, sequence_number, file_path, crc):
+    def __init__(self, command, sequence_number, fragment_count, crc):
         self.command = command
         self.sequence_number = sequence_number
-        self.file_path = file_path
+        self.fragment_count = fragment_count
         self.crc = crc
         # self.flags = flags
 
@@ -170,21 +178,23 @@ class CustomHeader:
         # The sequence_number and file_path must be converted to bytes if they are not already
         # CRC is a numerical value, computed over the data
         # Flags is a numerical value, fitting within 1 byte
-        return struct.pack('!B3s4sH', self.command, self.sequence_number, self.file_path, self.crc)
+        return struct.pack('!B3s3sH', self.command, self.sequence_number, self.fragment_count, self.crc)
 
     @staticmethod
     def deserialize(data):
-        unpacked_data = struct.unpack('!B3s4sH', data)
+        unpacked_data = struct.unpack('!B3s3sH', data)
         return CustomHeader(*unpacked_data)
 
 
+client_socket = None
+server_socket = None
 count_of_starts = 0
 while True:
     if count_of_starts == 0:
         print("==========================================================")
-        print("Hello! Please choose if you want to be a client or server")
+        print("Please choose if you want to be a client or server")
         print("After sending message/file, you will be asked to choose again")
-        print("If you want to exit, press CTRL+C")
+        print("If you want to exit input 0 or press CTRL+C")
         print("Or wait for timeout")
         print("==========================================================")
     else:
@@ -192,8 +202,8 @@ while True:
         print("Choose if you want to be a client or server")
         print("==========================================================")
 
-    chose_input = input("Choose input: 1 - client, 2 - server: ")
-
+    chose_input = input("Choose input: 1 - client, 2 - server, 3 - switch: ")
+    MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
     if chose_input == "1":  # Client Side
         IP_SERVER = input("Enter server IP: ")
         PORT_SERVER = int(input("Enter server port: "))
@@ -201,63 +211,108 @@ while True:
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (IP_SERVER, PORT_SERVER)
 
-        # Define the custom header fields
-        command = 0x01  # Example command
-        flags = 0x02  # Example flags value
-
         file_or_text = input("Choose input: 1 - text, 2 - file: ")
-        if file_or_text == "1":     # =========================     TEXT     =========================
+        corrupt = input("Do you want to corrupt packets? (y/n): ")
+        packet_data_size = int(input(f"Enter packet data size (MAX {MAX_DATA_SIZE}): "))
+        if packet_data_size != "" and not packet_data_size > MAX_DATA_SIZE:
+            MAX_DATA_SIZE = packet_data_size
+        else:
+            MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
+
+        if file_or_text == "1":  # =========================     TEXT     =========================
             try:
                 # Send TEXT
+                # print(f"file_or_text: {file_or_text}")
                 message_body = bytes(input("Enter the message: "), 'utf-8')
-                crc = calculate_crc16(message_body)
-
                 sequence_number = 0  # Example sequence number as 3 bytes
                 sequence_bytes = int_to_3bytes(sequence_number)
+                total_chunks = calculate_chunk_count(len(message_body), MAX_DATA_SIZE) - 1
+                total_chunks_bytes = int_to_3bytes(total_chunks)
 
-                # Create a header instance
-                if sequence_number == 0:    # send init packet
-                    # crc = calculate_crc16("Init")
-                    header_init = CustomHeader(PACKET_TYPES.get("Init"), sequence_bytes, b'Init', crc)
-                    response = send_packet(client_socket, header_init.serialize(), server_address)
-                    if response:
-                        print("Connection Innitiated")
-                    else:
-                        client_socket.close()
-                        exit(1)
+                # if sequence_number == 0:  # send init packet
+                # crc = calculate_crc16("Init")
+                crc = calculate_crc16(b"Init")
+                header_init = CustomHeader(PACKET_TYPES.get("INIT"), sequence_bytes, total_chunks_bytes, crc)
+                info_data = header_init.serialize() + b'text'
+                response = send_packet(client_socket, info_data, server_address)
+                print(f"Response: {response}")
+                if response:
+                    print("Connection Innitiated")
+                    # sequence_number += 1
                 else:
-                    header_text = CustomHeader(command, sequence_bytes, b'text_mess', crc)
+                    client_socket.close()
+                    exit(1)
+                for chunk in split_into_chunks(message_body, MAX_DATA_SIZE):
 
-                    total_message = header_text.serialize() + message_body
-                    print(f"Sending: {message_body}")
-                    sent = client_socket.sendto(total_message, server_address)
+                    # Calculate the CRC for the chunk
+                    crc = calculate_crc16(chunk)
 
-                    print("Waiting to receive")
-                    dat, server = client_socket.recvfrom(MAX_PACKET_SIZE)
-                    print(f"Received: {dat}")
+                    # Create header for this chunk
+                    if not (len(chunk) > MAX_DATA_SIZE - 1):
+                        print("last packet, sending FIN")
+                        fin_header = CustomHeader(PACKET_TYPES.get("FIN"), sequence_bytes, total_chunks_bytes, crc)
+                        packet = fin_header.serialize() + chunk
+                    else:
+                        header = CustomHeader(PACKET_TYPES.get("DATA"), sequence_bytes, total_chunks_bytes, crc)
+                        packet = header.serialize() + chunk
+
+                    if sequence_number == 1 and corrupt == "y":
+                        print("Corrupting packet")
+                        corr_packet = corrupt_packet(packet)
+                        # Send Corrupt packet
+                        response = send_packet(client_socket, corr_packet, server_address)
+                    else:
+                        # send packet
+                        response = send_packet(client_socket, packet, server_address)
+                    if response is None:
+                        print("Server not responding, closing connection...")
+                        client_socket.close()
+                        break
+                    elif response is not None and int.from_bytes(response, byteorder='big') == PACKET_TYPES.get(
+                                                                                                "ERROR"):
+                        print("Error, Tryning Again...")
+                        response = send_packet(client_socket, packet, server_address)
+
+
+                    # Increment the sequence number
+                    sequence_number = (sequence_number + 1) % (1 << 24)  # Ensure it wraps around at 2^24
+
+                    # Convert the incremented sequence number to a 3-byte byte object
+                    sequence_bytes = int_to_3bytes(sequence_number)
+
+            except Exception as e:
+                print(e)
+
             finally:
-                print("Text sent successfully")
+                print("Message sent successfully")
                 continue
-            # finally:
+                # finally:
             #     print("Closing socket")
             #     client_socket.close()
-        else:   # =========================     File     =========================
+        else:  # =========================     File     =========================
             response = None
             try:
                 # Input the file path
-                file_path_input = input("Enter the file path: ")
-                file_path = bytes(file_path_input, 'utf-8')
+                file_path_input = input("Enter path to save the file: ")
+                file_path = bytes(file_path_input+"|", 'utf-8')
+                if len(file_path) > MAX_DATA_SIZE - 1:
+                    print("File path too long")
+                    exit(1)
+                file_name_input = input("Enter path to file with file name: ")
+                # print(f"file_name : {extract_filename(file_name_input)}")
+                file_name = bytes(extract_filename(file_name_input), 'utf-8')
                 # crate a sequence number in bytes that is 3 bytes long
                 sequence_number = 0  # Example sequence number as 3 bytes
                 sequence_bytes = int_to_3bytes(sequence_number)
 
                 # Calculate the total number of chunks
-                total_chunks = calculate_total_chunks(file_path_input, MAX_DATA_SIZE) - 1
-
-                if sequence_number == 0:    # send init packet
+                total_chunks = calculate_total_chunks(file_name_input, MAX_DATA_SIZE) - 1
+                total_chunks_bytes = int_to_3bytes(total_chunks)
+                if sequence_number == 0:  # send init packet
                     crc = calculate_crc16(b"Init")
-                    header_init = CustomHeader(PACKET_TYPES.get("Init"), sequence_bytes, b'Init', crc)
-                    response = send_packet(client_socket, header_init.serialize(), server_address)
+                    header_init = CustomHeader(PACKET_TYPES.get("INIT"), sequence_bytes, total_chunks_bytes, crc)
+                    info_data = header_init.serialize() + b'file' + file_path + file_name
+                    response = send_packet(client_socket, info_data, server_address)
                     if response:
                         print("Connection Innitiated")
                         sequence_number += 1
@@ -265,98 +320,168 @@ while True:
                         client_socket.close()
                         exit(1)
 
-                for chunk in file_to_chunks(file_path_input, MAX_DATA_SIZE):
-                    # Assume a function `compute_crc` computes the CRC for the chunk
+                for chunk in file_to_chunks(file_name_input, MAX_DATA_SIZE):
+                    # Calculate the CRC for the chunk
                     crc = calculate_crc16(chunk)
-                    # Assume flags are set correctly for your custom protocol
-                    # flags = get_flags()
 
                     # Create header for this chunk
                     if not (len(chunk) > MAX_DATA_SIZE - 1):
                         print("last packet, sending FIN")
-                        fin_header = CustomHeader(PACKET_TYPES.get("Fin"), sequence_bytes, file_path, crc)
+                        fin_header = CustomHeader(PACKET_TYPES.get("FIN"), sequence_bytes, total_chunks_bytes, crc)
                         packet = fin_header.serialize() + chunk
                     else:
-                        header = CustomHeader(PACKET_TYPES.get("Data"), sequence_bytes, file_path, crc)
+                        header = CustomHeader(PACKET_TYPES.get("DATA"), sequence_bytes, total_chunks_bytes, crc)
                         packet = header.serialize() + chunk
-                    # if sequence_number == 716:
-                    #     print("Corrupting packet")
-                    #     packet = corrupt_packet(packet)
-                    # Send packet
-                    response = send_packet(client_socket, packet, server_address)
+                    if sequence_number == 1 and corrupt == "y":
+                        print("Corrupting packet")
+                        corr_packet = corrupt_packet(packet)
+                        # Send Corrupt packet
+                        response = send_packet(client_socket, corr_packet, server_address)
+                    else:
+                        # send packet
+                        response = send_packet(client_socket, packet, server_address)
                     if response is None:
-                        # print("Server not responding, closing connection...")
+                        print("Server not responding, closing connection...")
                         client_socket.close()
                         break
+                    elif response is not None and int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("ERROR"):
+                        print("Error, Tryning Again...")
+                        response = send_packet(client_socket, packet, server_address)
 
-                    # client_socket.sendto(packet, server_address)
                     # Increment the sequence number
                     sequence_number = (sequence_number + 1) % (1 << 24)  # Ensure it wraps around at 2^24
 
                     # Convert the incremented sequence number to a 3-byte byte object
                     sequence_bytes = int_to_3bytes(sequence_number)
 
-                    # dat, server = client_socket.recvfrom(MAX_PACKET_SIZE)
-                    # print(f"Received: {dat.decode('utf-8')}")
                 if response is not None:
                     print(f"File sent successfully = {total_chunks} packets")
-                # print("File sent successfully = ", total_chunks)
+            except Exception as e:
+                print(e)
             finally:
-                print("file sent successfully")
+                # print("file sent successfully")
                 continue
-                # print("Closing socket")
-                # client_socket.close()
 
-
-    else:   # Server Side
+    elif chose_input == "2":  # Server Side
 
         # Set up the server socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         server_address = (IP_SERVER, PORT_SERVER)
         server_socket.bind(server_address)
         print(f"Starting up on {server_address[0]} port {server_address[1]}")
+        received_chunks = {}
+        type_of_data = None
+        file_path = "./"
+        file_name = "received_file.txt"
         try:
             while True:
+                server_socket.settimeout(15)
                 print("\nWaiting to receive message...")
                 packet, address = server_socket.recvfrom(MAX_PACKET_SIZE)
                 print(f"[+DEBUG+]Received {len(packet)} bytes from {address}")
                 # Assuming the custom header is at the beginning of the packet
                 header_data = packet[:HEADER_SIZE]  # 1 + 3 + 4 + 2 + 1 = 11 bytes for the header
                 message_data = packet[HEADER_SIZE:]  # The rest is the payload
-
                 # Deserialize the header
                 header = CustomHeader.deserialize(header_data)
 
-                # You might want to verify the CRC to ensure data integrity
+                # Calculate the CRC for the message data and verify it matches the received CRC
                 received_crc = header.crc
                 computed_crc = binascii.crc_hqx(message_data, 0)
-                if header.command == 0x01:
+                if header.command == 0x06:  # CHANGE packet
+                    print("Change packet received")
+                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), address)
+                    print("Closing connection...")
+                    server_socket.close()
+                    break
+                if header.command == 0x01:  # INIT packet
                     print("Init packet received")
-                    server_socket.sendto(int.to_bytes(0x03, length=1, byteorder='big'), address)
+                    type_of_data = message_data[0:4]
+                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), address)
+                    if type_of_data == b'file':
+                        print("File transfer initiated")
+                        file_info = bytes.decode(message_data[4:])
+                        file_path = file_info.split("|")[0]
+                        file_name = file_info.split("|")[1]
+                        print(f"File path: {file_path}")
+                        print(f"File name: {file_name}")
+                        print(
+                            f"Received header: Command={header.command}, "
+                            f"Sequence Number={int.from_bytes(header.sequence_number, byteorder='big')}, "
+                            f"Total Fragments={int.from_bytes(header.fragment_count, byteorder='big')}, "
+                            f"CRC={header.crc:04x}, ")
                     continue
 
-                if received_crc != computed_crc:
+                if received_crc != computed_crc:  # CRC check
                     print("CRC check failed, packet corrupted.")
+                    server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ERROR"),
+                                                      length=1, byteorder='big'), address)
                 else:
-                    if header.command == 0x02:
+                    if header.command == 0x02:  # DATA packet
                         print("Data packet received")
                         # send back to client
-                        server_socket.sendto(int.to_bytes(0x03, length=1, byteorder='big'), address)
-                    elif header.command == 0x04:
+                        server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"),
+                                                          length=1, byteorder='big'), address)
+                    elif header.command == 0x04:  # FIN packet
                         print("FIN packet received")
                         # send back to client
-                        server_socket.sendto(int.to_bytes(0x05, length=1, byteorder='big'), address)
+                        server_socket.sendto(int.to_bytes(PACKET_TYPES.get("FINACK"),
+                                                          length=1, byteorder='big'), address)
                 # Output the received header and data for demonstration purposes
                 print(
                     f"Received header: Command={header.command}, "
                     f"Sequence Number={int.from_bytes(header.sequence_number, byteorder='big')}, "
-                    f"File Path={header.file_path}, "
+                    f"Total Fragments={int.from_bytes(header.fragment_count, byteorder='big')}, "
                     f"CRC={header.crc:04x}, ")
-                print(f"Received data: {message_data}")
+                # print(f"Received data: {message_data}")
 
-                # Here you can implement your logic to handle the received data
-                # ...
+                received_chunks[int.from_bytes(header.sequence_number, byteorder='big')] = message_data
 
+                # If the FIN packet is received, construct the file
+                if header.command == 0x04 and bytes.decode(type_of_data) == "file":
+                    try:
+                        print("Constructing File")
+                        with open(f'{file_path}{file_name}', 'wb') as file:
+                            for seq in sorted(received_chunks.keys()):
+                                file.write(received_chunks[seq])
+                        file.close()
+                        print("File constructed")
+                    except Exception as e:
+                        print(e)
+                elif header.command == 0x04 and bytes.decode(type_of_data) == "text":
+                    # print("Fin packet received, closing connection...")
+                    full_text = []
+                    for dt in received_chunks.values():
+                        full_text.append(bytes.decode(dt))
+
+                    print(f"Received data: {''.join(full_text)}")
+        except socket.timeout:
+            print("Timeout, closing connection...")
+            server_socket.close()
+            continue
         finally:
             server_socket.close()
 
+    elif chose_input == "3":  # Switch
+        if client_socket is None:
+            print("You are not connected to server")
+            continue
+        if server_socket is None:
+            print("There is no server running")
+            continue
+        crc = calculate_crc16(b"Change")
+        header_init = CustomHeader(PACKET_TYPES.get("CHANGE"), b"0", b"0", crc)
+        info_data = header_init.serialize()
+        response = send_packet(client_socket, info_data, (IP_SERVER, PORT_SERVER))
+        if response:
+            print("Change Innitiated")
+            client_socket.close()
+            continue
+
+    elif chose_input == "0":
+        print("Exiting...")
+        if client_socket is not None:
+            client_socket.close()
+        if server_socket is not None:
+            server_socket.close()
+        break
