@@ -12,9 +12,9 @@ import random
 import re
 
 # CONFIG    ====================================================
-IP_CLIENT = ""
+IP_CLIENT = "localhost"
 PORT_CLIENT = 8000
-IP_SERVER = ""
+IP_SERVER = "localhost"
 PORT_SERVER = 8000
 MAX_PACKET_SIZE = 1469
 HEADER_SIZE = 9
@@ -207,31 +207,29 @@ client_socket = None
 server_socket = None
 count_of_starts = 0
 count_of_switches = 0
+chose_input = None
 switch_initiated = False
+
 while True:
-    if count_of_starts == 0:
+    if count_of_starts == 0 and not switch_initiated:
         print("==========================================================")
         print("Please choose if you want to be a client or server")
         print("After sending message/file, you will be asked to choose again")
         print("If you want to exit input 0 or press CTRL+C")
         print("Or wait for timeout")
         print("==========================================================")
-    else:
-        print("==========================================================")
-        print("Choose if you want to be a client or server")
-        print("==========================================================")
-    if not switch_initiated:
+
         chose_input = input("Choose input: 1 - client, 2 - server, 3 - switch: ")
 
     MAX_DATA_SIZE = MAX_PACKET_SIZE - HEADER_SIZE
     if chose_input == "1":  # Client Side
-        if not switch_initiated:
+        if not switch_initiated and count_of_starts == 0:
             IP_SERVER = input("Enter server IP: ")
             PORT_SERVER = int(input("Enter server port: "))
             IP_CLIENT = get_ethernet_ip()
             print(f" CLIENT IP : {IP_CLIENT}")
 
-        else:
+        elif switch_initiated:
             IP_SERVER = IP_CLIENT[0]
             if count_of_switches == 1:
                 PORT_SERVER = int(input("Enter server port: "))
@@ -324,11 +322,38 @@ while True:
                 print(e)
 
             finally:
-                print("Message sent successfully")
-                print(f" CLIENT IP : {IP_CLIENT}")
-                print(f" CLIENT PORT : {PORT_CLIENT}")
-                print(f" SERVER IP : {IP_SERVER}")
-                print(f" SERVER PORT : {PORT_SERVER}")
+
+                print("Waiting for switch packet")
+                try:
+
+                    # server_address = (IP_SERVER, PORT_SERVER)
+                    client_socket.settimeout(4)
+
+                    response, _ = client_socket.recvfrom(1024)  # buffer for switch packet from server
+                    if int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("CHANGE"):
+                        client_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'), (IP_SERVER, PORT_SERVER))
+                        print("Switching...")
+                        chose_input = "2"
+                        client_socket.close()
+                        switch_initiated = True
+                        count_of_starts = 0
+                        temp = IP_SERVER
+                        IP_SERVER = IP_CLIENT[0]
+                        IP_CLIENT = temp
+                        temp = PORT_SERVER
+                        PORT_SERVER = PORT_CLIENT
+                        PORT_CLIENT = temp
+                        count_of_switches = 1
+                        continue
+                except socket.timeout:
+                    print("No switch packet received")
+                    count_of_starts = 1
+                    continue
+                # print("Message sent successfully")
+                # print(f" CLIENT IP : {IP_CLIENT}")
+                # print(f" CLIENT PORT : {PORT_CLIENT}")
+                # print(f" SERVER IP : {IP_SERVER}")
+                # print(f" SERVER PORT : {PORT_SERVER}")
                 # continue
                 # finally:
             #     print("Closing socket")
@@ -403,8 +428,31 @@ while True:
             except Exception as e:
                 print(e)
             finally:
-                # print("file sent successfully")
-                continue
+                print("Waiting for switch packet")
+                try:
+                    client_socket.settimeout(4)
+
+                    response, _ = client_socket.recvfrom(1024)  # buffer for switch packet from server
+                    if int.from_bytes(response, byteorder='big') == PACKET_TYPES.get("CHANGE"):
+                        client_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"), length=1, byteorder='big'),
+                                             (IP_SERVER, PORT_SERVER))
+                        print("Switching...")
+                        chose_input = "2"
+                        client_socket.close()
+                        switch_initiated = True
+                        count_of_starts = 0
+                        temp = IP_SERVER
+                        IP_SERVER = IP_CLIENT[0]
+                        IP_CLIENT = temp
+                        temp = PORT_SERVER
+                        PORT_SERVER = PORT_CLIENT
+                        PORT_CLIENT = temp
+                        count_of_switches = 1
+                        continue
+                except socket.timeout:
+                    print("No switch packet received")
+                    count_of_starts = 1
+                    continue
 
     elif chose_input == "2":  # Server Side
 
@@ -412,6 +460,7 @@ while True:
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         IP_SERVER = get_ethernet_ip()
         PORT_SERVER = int(input("Enter server port: "))
+
         server_address = (IP_SERVER, PORT_SERVER)
         server_socket.bind(server_address)
         print(f"Starting up on {server_address[0]} port {server_address[1]}")
@@ -421,6 +470,7 @@ while True:
         file_name = "received_file.txt"
         try:
             while True:
+
                 server_socket.settimeout(15)
                 print("\nWaiting to receive message...")
                 packet, IP_CLIENT = server_socket.recvfrom(MAX_PACKET_SIZE)
@@ -494,6 +544,18 @@ while True:
                                 file.write(received_chunks[seq])
                         file.close()
                         print("File constructed")
+                        server_switch = input("Do you want to switch ? (y/n): ")
+                        if server_switch == "y":
+                            server_switch = ""
+                            print("Switching... from server")
+                            server_socket.sendto(int.to_bytes(PACKET_TYPES.get("CHANGE"), length=1, byteorder='big'),
+                                                 IP_CLIENT)
+                            response = server_socket.recvfrom(1024)
+                            if response:
+                                switch_initiated = True
+                                count_of_switches = 1
+                                chose_input = "1"
+                                break
                     except Exception as e:
                         print(e)
                 elif header.command == 0x04 and bytes.decode(type_of_data) == "text":
@@ -503,10 +565,23 @@ while True:
                         full_text.append(bytes.decode(dt))
 
                     print(f"Received data: {''.join(full_text)}")
+                    server_switch = input("Do you want to switch ? (y/n): ")
+                    if server_switch == "y":
+                        server_switch = ""
+                        print("Switching... from server")
+                        server_socket.sendto(int.to_bytes(PACKET_TYPES.get("CHANGE"), length=1, byteorder='big'),
+                                             IP_CLIENT)
+                        response = server_socket.recvfrom(1024)
+                        if response:
+                            switch_initiated = True
+                            count_of_switches = 1
+                            chose_input = "1"
+                            break
         except socket.timeout:
             print("Timeout, closing connection...")
             server_socket.close()
             switch_initiated = False
+            count_of_starts = 0
             continue
         finally:
             pass
