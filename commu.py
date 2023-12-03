@@ -544,6 +544,7 @@ while True:
                                 file.write(received_chunks[seq])
                         file.close()
                         print("File constructed")
+                        print(f"File is save at {file_path}{file_name}")
                         server_switch = input("Do you want to switch ? (y/n): ")
                         if server_switch == "y":
                             server_switch = ""
