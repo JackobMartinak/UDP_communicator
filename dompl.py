@@ -12,9 +12,9 @@ import random
 import re
 
 # CONFIG    ====================================================
-IP_CLIENT = "localhost"
+IP_CLIENT = "127.0.0.1"
 PORT_CLIENT = 8000
-IP_SERVER = "localhost"
+IP_SERVER = "127.0.0.2"
 PORT_SERVER = 8000
 MAX_PACKET_SIZE = 1469
 HEADER_SIZE = 9
@@ -226,7 +226,7 @@ while True:
         if not switch_initiated and count_of_starts == 0:
             IP_SERVER = input("Enter server IP: ")
             PORT_SERVER = int(input("Enter server port: "))
-            IP_CLIENT = get_ethernet_ip()
+            # IP_CLIENT = get_ethernet_ip()
             print(f" CLIENT IP : {IP_CLIENT}")
 
         elif switch_initiated:
@@ -280,17 +280,22 @@ while True:
                 else:
                     client_socket.close()
                     exit(1)
-                for chunk in split_into_chunks(message_body, MAX_DATA_SIZE):
+
+                chunks = split_into_chunks(message_body, MAX_DATA_SIZE)
+
+                for chunk in chunks:
 
                     # Calculate the CRC for the chunk
                     crc = calculate_crc16(chunk)
 
+
                     # Create header for this chunk
-                    if not (len(chunk) > MAX_DATA_SIZE - 1):
+                    if not (len(chunk) >= MAX_DATA_SIZE):
                         print("last packet, sending FIN")
                         fin_header = CustomHeader(PACKET_TYPES.get("FIN"), sequence_bytes, total_chunks_bytes, crc)
                         packet = fin_header.serialize() + chunk
                     else:
+
                         header = CustomHeader(PACKET_TYPES.get("DATA"), sequence_bytes, total_chunks_bytes, crc)
                         packet = header.serialize() + chunk
 
@@ -300,8 +305,18 @@ while True:
                         # Send Corrupt packet
                         response = send_packet(client_socket, corr_packet, server_address)
                     else:
+                        sequence_number = (sequence_number + 1) % (1 << 24)  # Ensure it wraps around at 2^24
+
+                        # Convert the incremented sequence number to a 3-byte byte object
+                        sequence_bytes = int_to_3bytes(sequence_number)
                         # send packet
-                        response = send_packet(client_socket, packet, server_address)
+                        for i in range(4):
+                            response = send_packet(client_socket, packet, server_address)
+                            # if response is not None and int.from_bytes(response, byteorder='big') == PACKET_TYPES.get(
+                            #     "ERROR"):
+                            #     print("Error, Tryning Again...")
+                            #     response = send_packet(client_socket, packet, server_address)
+                        # response = send_packet(client_socket, packet, server_address)
                     if response is None:
                         print("Server not responding, closing connection...")
                         client_socket.close()
@@ -310,7 +325,11 @@ while True:
                                                                                                 "ERROR"):
                         print("Error, Tryning Again...")
                         response = send_packet(client_socket, packet, server_address)
-
+                    if chunk == chunks[-1]:
+                        print("last packet, sending FIN")
+                        fin_header = CustomHeader(PACKET_TYPES.get("FIN"), sequence_bytes, total_chunks_bytes, crc)
+                        packet = fin_header.serialize() + chunk
+                        response = send_packet(client_socket, packet, server_address)
 
                     # Increment the sequence number
                     sequence_number = (sequence_number + 1) % (1 << 24)  # Ensure it wraps around at 2^24
@@ -458,7 +477,8 @@ while True:
 
         # Set up the server socket
         server_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        IP_SERVER = get_ethernet_ip()
+        # IP_SERVER = get_ethernet_ip()
+
         PORT_SERVER = int(input("Enter server port: "))
 
         server_address = (IP_SERVER, PORT_SERVER)
@@ -467,6 +487,8 @@ while True:
         received_chunks = {}
         type_of_data = None
         file_path = "./"
+        repl = 0
+        last_mess = ""
         file_name = ""
         try:
             while True:
@@ -517,9 +539,20 @@ while True:
                 else:
                     if header.command == 0x02:  # DATA packet
                         print("Data packet received")
-                        # send back to client
-                        server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"),
-                                                          length=1, byteorder='big'), IP_CLIENT)
+                        if bytes.decode(message_data) == last_mess:
+                            repl = 1
+                            print(f"Prjaty zreplovany packet {bytes.decode(message_data)}")
+                            # send back to client
+                            server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"),
+                                                              length=1, byteorder='big'), IP_CLIENT)
+
+                        else:
+                            last_mess = bytes.decode(message_data)
+                            repl = 0
+                            server_socket.sendto(int.to_bytes(PACKET_TYPES.get("ACK"),
+                                                              length=1, byteorder='big'), IP_CLIENT)
+                            # received_chunks[int.from_bytes(header.sequence_number, byteorder='big')] = message_data
+                            # continue
                     elif header.command == 0x04:  # FIN packet
                         print("FIN packet received")
                         # send back to client
@@ -532,8 +565,8 @@ while True:
                     f"Total Fragments={int.from_bytes(header.fragment_count, byteorder='big')}, "
                     f"CRC={header.crc:04x}, ")
                 # print(f"Received data: {message_data}")
-
-                received_chunks[int.from_bytes(header.sequence_number, byteorder='big')] = message_data
+                if repl ==0:
+                    received_chunks[int.from_bytes(header.sequence_number, byteorder='big')] = message_data
 
                 # If the FIN packet is received, construct the file
                 if header.command == 0x04 and bytes.decode(type_of_data) == "file":
